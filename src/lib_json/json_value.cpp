@@ -67,7 +67,12 @@ static std::unique_ptr<T> cloneUnique(const std::unique_ptr<T>& p) {
 #endif
 
 // static
-Value const& Value::nullSingleton() {
+Value const& Value::nullSingleton(bool preserve) {
+  if (preserve) {
+    static Value const preserveStatic(nullValue, preserve);
+    return preserveStatic;
+  }
+
   static Value const nullStatic;
   return nullStatic;
 }
@@ -257,11 +262,13 @@ Value::CZString::CZString(const CZString& other) {
               : static_cast<DuplicationPolicy>(other.storage_.policy_)) &
       3U;
   storage_.length_ = other.storage_.length_;
+  orderidx_ = other.orderidx_;
 }
 
 Value::CZString::CZString(CZString&& other) noexcept
-    : cstr_(other.cstr_), index_(other.index_) {
+    : cstr_(other.cstr_), index_(other.index_), orderidx_(other.orderidx_) {
   other.cstr_ = nullptr;
+  other.orderidx_ = 0;
 }
 
 Value::CZString::~CZString() {
@@ -282,19 +289,23 @@ void Value::CZString::swap(CZString& other) {
 Value::CZString& Value::CZString::operator=(const CZString& other) {
   cstr_ = other.cstr_;
   index_ = other.index_;
+  orderidx_ = other.orderidx_;
   return *this;
 }
 
 Value::CZString& Value::CZString::operator=(CZString&& other) noexcept {
   cstr_ = other.cstr_;
   index_ = other.index_;
+  orderidx_ = other.orderidx_;
   other.cstr_ = nullptr;
+  other.orderidx_ = 0;
   return *this;
 }
 
 bool Value::CZString::operator<(const CZString& other) const {
   if (!cstr_)
     return index_ < other.index_;
+
   // return strcmp(cstr_, other.cstr_) < 0;
   // Assume both are strings.
   unsigned this_len = this->storage_.length_;
@@ -302,6 +313,15 @@ bool Value::CZString::operator<(const CZString& other) const {
   unsigned min_len = std::min<unsigned>(this_len, other_len);
   JSON_ASSERT(this->cstr_ && other.cstr_);
   int comp = memcmp(this->cstr_, other.cstr_, min_len);
+  if (comp != 0 || this_len != other_len) {
+    auto idx = orderidx_;
+    auto oidx = other.orderidx_;
+    if (idx != 0 || oidx != 0) {
+      // a 0 index here means it should be sorted at the end
+      return (idx != 0 && oidx != 0) ? (idx < oidx) : ((idx != 0) || oidx == 0);
+    }
+  }
+
   if (comp < 0)
     return true;
   if (comp > 0)
@@ -344,7 +364,9 @@ bool Value::CZString::isStaticString() const {
  * memset( this, 0, sizeof(Value) )
  * This optimization is used in ValueInternalMap fast allocator.
  */
-Value::Value(ValueType type) {
+Value::Value(ValueType type, bool preserve)
+  : preserveorder_(preserve)
+{
   static char const emptyString[] = "";
   initBasic(type);
   switch (type) {
@@ -428,12 +450,14 @@ Value::Value(bool value) {
   value_.bool_ = value;
 }
 
-Value::Value(const Value& other) {
+Value::Value(const Value& other)
+{
   dupPayload(other);
   dupMeta(other);
 }
 
-Value::Value(Value&& other) noexcept {
+Value::Value(Value&& other) noexcept
+{
   initBasic(nullValue);
   swap(other);
 }
@@ -465,6 +489,7 @@ void Value::copyPayload(const Value& other) {
 
 void Value::swap(Value& other) {
   swapPayload(other);
+  other.preserveorder_ = preserveorder_;
   std::swap(comments_, other.comments_);
   std::swap(start_, other.start_);
   std::swap(limit_, other.limit_);
@@ -897,6 +922,7 @@ void Value::clear() {
   case arrayValue:
   case objectValue:
     value_.map_->clear();
+    curorderidx_ = 0;
     break;
   default:
     break;
@@ -927,13 +953,13 @@ Value& Value::operator[](ArrayIndex index) {
       type() == nullValue || type() == arrayValue,
       "in Json::Value::operator[](ArrayIndex): requires arrayValue");
   if (type() == nullValue)
-    *this = Value(arrayValue);
+    *this = Value(arrayValue, preserveorder_);
   CZString key(index);
   auto it = value_.map_->lower_bound(key);
   if (it != value_.map_->end() && (*it).first == key)
     return (*it).second;
 
-  ObjectValues::value_type defaultValue(key, nullSingleton());
+  ObjectValues::value_type defaultValue(key, nullSingleton(preserveorder_));
   it = value_.map_->insert(it, defaultValue);
   return (*it).second;
 }
@@ -1027,6 +1053,7 @@ void Value::releasePayload() {
 }
 
 void Value::dupMeta(const Value& other) {
+  preserveorder_ = other.preserveorder_;
   comments_ = other.comments_;
   start_ = other.start_;
   limit_ = other.limit_;
@@ -1040,14 +1067,20 @@ Value& Value::resolveReference(const char* key) {
       type() == nullValue || type() == objectValue,
       "in Json::Value::resolveReference(): requires objectValue");
   if (type() == nullValue)
-    *this = Value(objectValue);
+    *this = Value(objectValue, preserveorder_);
   CZString actualKey(key, static_cast<unsigned>(strlen(key)),
                      CZString::noDuplication); // NOTE!
   auto it = value_.map_->lower_bound(actualKey);
-  if (it != value_.map_->end() && (*it).first == actualKey)
+  if (it != value_.map_->end() && (*it).first == actualKey) {
     return (*it).second;
+  }
 
-  ObjectValues::value_type defaultValue(actualKey, nullSingleton());
+  // save the insertion order
+  if (preserveorder_) {
+    actualKey.orderidx(++curorderidx_);
+  }
+
+  ObjectValues::value_type defaultValue(actualKey, nullSingleton(preserveorder_));
   it = value_.map_->insert(it, defaultValue);
   Value& value = (*it).second;
   return value;
@@ -1059,14 +1092,20 @@ Value& Value::resolveReference(char const* key, char const* end) {
       type() == nullValue || type() == objectValue,
       "in Json::Value::resolveReference(key, end): requires objectValue");
   if (type() == nullValue)
-    *this = Value(objectValue);
+    *this = Value(objectValue, preserveorder_);
   CZString actualKey(key, static_cast<unsigned>(end - key),
                      CZString::duplicateOnCopy);
   auto it = value_.map_->lower_bound(actualKey);
-  if (it != value_.map_->end() && (*it).first == actualKey)
+  if (it != value_.map_->end() && (*it).first == actualKey) {
     return (*it).second;
+  }
 
-  ObjectValues::value_type defaultValue(actualKey, nullSingleton());
+  // save the insertion order
+  if (preserveorder_) {
+    actualKey.orderidx(++curorderidx_);
+  }
+
+  ObjectValues::value_type defaultValue(actualKey, nullSingleton(preserveorder_));
   it = value_.map_->insert(it, defaultValue);
   Value& value = (*it).second;
   return value;

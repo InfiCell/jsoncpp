@@ -218,7 +218,7 @@ public:
 #endif
 
   // null and nullRef are deprecated, use this instead.
-  static Value const& nullSingleton();
+  static Value const& nullSingleton(bool preserve = false);
 
   /// Minimum signed integer value that can be stored in a Json::Value.
   static constexpr LargestInt minLargestInt =
@@ -277,6 +277,8 @@ private:
     unsigned length() const;
     bool isStaticString() const;
 
+    void orderidx(uint64_t v) { orderidx_ = v; }
+
   private:
     void swap(CZString& other);
 
@@ -290,9 +292,17 @@ private:
       ArrayIndex index_;
       StringStorage storage_;
     };
+
+    uint64_t orderidx_ = 0;
   };
 
 public:
+  struct ObjectValuesCmp {
+    bool operator()(const CZString& a, const CZString& b) {
+      return a < b;
+    }
+  };
+
   typedef std::map<CZString, Value> ObjectValues;
 #endif // ifndef JSONCPP_DOC_EXCLUDE_IMPLEMENTATION
 
@@ -313,7 +323,7 @@ public:
    *   Json::Value obj_value(Json::objectValue); // {}
    *   \endcode
    */
-  Value(ValueType type = nullValue);
+  Value(ValueType type = nullValue, bool preserve = false);
   Value(Int value);
   Value(UInt value);
 #if defined(JSON_HAS_INT64)
@@ -562,6 +572,8 @@ public:
   /// \post if type() was nullValue, it remains nullValue
   Members getMemberNames() const;
 
+  void preserveOrder(bool b) { preserveorder_ = b; }
+
   /// \deprecated Always pass len.
   JSONCPP_DEPRECATED("Use setComment(String const&) instead.")
   void setComment(const char* comment, CommentPlacement placement) {
@@ -616,6 +628,8 @@ private:
   //   }
   //};
 
+  bool preserveorder_ = false;
+  uint64_t curorderidx_ = 0;
   union ValueHolder {
     LargestInt int_;
     LargestUInt uint_;
